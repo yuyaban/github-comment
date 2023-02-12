@@ -51,7 +51,8 @@ func (ctrl *PostController) Post(ctx context.Context, opts *option.PostOptions) 
 }
 
 func (ctrl *PostController) setUpdatedCommentID(ctx context.Context, cmt *github.Comment, updateCondition string) error { //nolint:funlen
-	prg, err := ctrl.Expr.Compile(updateCondition)
+	custom_updateCondition := fmt.Sprintf("%s && Comment.Meta.Vars.target == \"%s\"", updateCondition, ctrl.Config.Vars["target"])
+	prg, err := ctrl.Expr.Compile(custom_updateCondition)
 	if err != nil {
 		return err //nolint:wrapcheck
 	}
@@ -151,6 +152,15 @@ type Platform interface {
 	CI() string
 }
 
+func contains(elems []string, v string) bool {
+	for _, s := range elems {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
 func (ctrl *PostController) getCommentParams(ctx context.Context, opts *option.PostOptions) (*github.Comment, error) { //nolint:funlen,cyclop,gocognit
 	if ctrl.Platform != nil {
 		if err := ctrl.Platform.ComplementPost(opts); err != nil {
@@ -203,6 +213,9 @@ func (ctrl *PostController) getCommentParams(ctx context.Context, opts *option.P
 		opts.Template = tpl.Template
 		opts.TemplateForTooLong = tpl.TemplateForTooLong
 		opts.EmbeddedVarNames = tpl.EmbeddedVarNames
+		if !contains(opts.EmbeddedVarNames, "target") {
+			opts.EmbeddedVarNames = append(opts.EmbeddedVarNames, "target")
+		}
 		if opts.UpdateCondition == "" {
 			opts.UpdateCondition = tpl.UpdateCondition
 		}
@@ -213,6 +226,9 @@ func (ctrl *PostController) getCommentParams(ctx context.Context, opts *option.P
 	}
 	for k, v := range opts.Vars {
 		cfg.Vars[k] = v
+	}
+	if cfg.Vars["target"] == nil {
+		cfg.Vars["target"] = ""
 	}
 
 	ci := ""
