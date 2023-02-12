@@ -152,7 +152,7 @@ type Platform interface {
 	CI() string
 }
 
-func (ctrl *PostController) contains(elems []string, v string) bool {
+func contains(elems []string, v string) bool {
 	for _, s := range elems {
 		if v == s {
 			return true
@@ -213,7 +213,7 @@ func (ctrl *PostController) getCommentParams(ctx context.Context, opts *option.P
 		opts.Template = tpl.Template
 		opts.TemplateForTooLong = tpl.TemplateForTooLong
 		opts.EmbeddedVarNames = tpl.EmbeddedVarNames
-		if !ctrl.contains(opts.EmbeddedVarNames, "target") {
+		if !contains(opts.EmbeddedVarNames, "target") {
 			opts.EmbeddedVarNames = append(opts.EmbeddedVarNames, "target")
 		}
 		if opts.UpdateCondition == "" {

@@ -92,6 +92,9 @@ func (ctrl *ExecController) Exec(ctx context.Context, opts *option.ExecOptions) 
 	for k, v := range opts.Vars {
 		cfg.Vars[k] = v
 	}
+	if cfg.Vars["target"] == nil {
+		cfg.Vars["target"] = ""
+	}
 
 	ci := ""
 	if ctrl.Platform != nil {
@@ -105,19 +108,20 @@ func (ctrl *ExecController) Exec(ctx context.Context, opts *option.ExecOptions) 
 		CombinedOutput: result.CombinedOutput,
 	})
 	if err := ctrl.post(ctx, execConfigs, &ExecCommentParams{
-		ExitCode:       result.ExitCode,
-		Command:        result.Cmd,
-		JoinCommand:    joinCommand,
-		Stdout:         result.Stdout,
-		Stderr:         result.Stderr,
-		CombinedOutput: result.CombinedOutput,
-		PRNumber:       opts.PRNumber,
-		Org:            opts.Org,
-		Repo:           opts.Repo,
-		SHA1:           opts.SHA1,
-		TemplateKey:    opts.TemplateKey,
-		Template:       opts.Template,
-		Vars:           cfg.Vars,
+		ExitCode:        result.ExitCode,
+		Command:         result.Cmd,
+		JoinCommand:     joinCommand,
+		Stdout:          result.Stdout,
+		Stderr:          result.Stderr,
+		CombinedOutput:  result.CombinedOutput,
+		PRNumber:        opts.PRNumber,
+		Org:             opts.Org,
+		Repo:            opts.Repo,
+		SHA1:            opts.SHA1,
+		TemplateKey:     opts.TemplateKey,
+		Template:        opts.Template,
+		UpdateCondition: opts.UpdateCondition,
+		Vars:            cfg.Vars,
 	}, templates); err != nil {
 		if !opts.Silent {
 			fmt.Fprintf(ctrl.Stderr, "github-comment error: %+v\n", err)
@@ -143,10 +147,11 @@ type ExecCommentParams struct {
 	// Repo is the GitHub Repository name
 	Repo string
 	// SHA1 is the commit SHA1
-	SHA1        string
-	TemplateKey string
-	Template    string
-	Vars        map[string]interface{}
+	SHA1            string
+	TemplateKey     string
+	Template        string
+	UpdateCondition string
+	Vars            map[string]interface{}
 }
 
 type Executor interface {
@@ -168,7 +173,8 @@ func (ctrl *ExecController) getExecConfigs(cfg *config.Config, opts *option.Exec
 			}
 			execConfigs = []*config.ExecConfig{
 				{
-					When: "ExitCode != 0",
+					When:            "ExitCode != 0",
+					UpdateCondition: `Comment.HasMeta && Comment.Meta.TemplateKey == "default"`,
 					Template: `{{template "status" .}} {{template "link" .}}
 
 {{template "join_command" .}}
@@ -203,10 +209,11 @@ func (ctrl *ExecController) getExecConfig(
 
 // getComment returns Comment.
 // If the second returned value is false, no comment is posted.
-func (ctrl *ExecController) getComment(execConfigs []*config.ExecConfig, cmtParams *ExecCommentParams, templates map[string]string) (*github.Comment, bool, error) { //nolint:funlen
+func (ctrl *ExecController) getComment(ctx context.Context, execConfigs []*config.ExecConfig, cmtParams *ExecCommentParams, templates map[string]string) (*github.Comment, bool, error) { //nolint:funlen
 	tpl := cmtParams.Template
 	tplForTooLong := ""
 	var embeddedVarNames []string
+	var UpdateCondition string
 	if tpl == "" {
 		execConfig, f, err := ctrl.getExecConfig(execConfigs, cmtParams)
 		if err != nil {
@@ -221,6 +228,11 @@ func (ctrl *ExecController) getComment(execConfigs []*config.ExecConfig, cmtPara
 		tpl = execConfig.Template
 		tplForTooLong = execConfig.TemplateForTooLong
 		embeddedVarNames = execConfig.EmbeddedVarNames
+		if execConfig.UpdateCondition == "" {
+			UpdateCondition = cmtParams.UpdateCondition
+		} else {
+			UpdateCondition = execConfig.UpdateCondition
+		}
 	}
 
 	body, err := ctrl.Renderer.Render(tpl, templates, cmtParams)
@@ -237,6 +249,10 @@ func (ctrl *ExecController) getComment(execConfigs []*config.ExecConfig, cmtPara
 		Expr:     ctrl.Expr,
 		Getenv:   ctrl.Getenv,
 		Platform: ctrl.Platform,
+	}
+
+	if !contains(embeddedVarNames, "target") {
+		embeddedVarNames = append(embeddedVarNames, "target")
 	}
 
 	embeddedMetadata := make(map[string]interface{}, len(embeddedVarNames))
@@ -258,7 +274,7 @@ func (ctrl *ExecController) getComment(execConfigs []*config.ExecConfig, cmtPara
 	body += embeddedComment
 	bodyForTooLong += embeddedComment
 
-	return &github.Comment{
+	cmt := github.Comment{
 		PRNumber:       cmtParams.PRNumber,
 		Org:            cmtParams.Org,
 		Repo:           cmtParams.Repo,
@@ -267,14 +283,94 @@ func (ctrl *ExecController) getComment(execConfigs []*config.ExecConfig, cmtPara
 		SHA1:           cmtParams.SHA1,
 		Vars:           cmtParams.Vars,
 		TemplateKey:    cmtParams.TemplateKey,
-	}, true, nil
+	}
+	if UpdateCondition != "" && cmtParams.PRNumber != 0 {
+		if err := ctrl.setUpdatedCommentID(ctx, &cmt, UpdateCondition); err != nil {
+			return nil, false, fmt.Errorf("set updateCommentID: %w", err)
+		}
+	}
+
+	return &cmt, true, nil
+}
+
+func (ctrl *ExecController) setUpdatedCommentID(ctx context.Context, cmt *github.Comment, updateCondition string) error { //nolint:funlen
+	custom_updateCondition := fmt.Sprintf("%s && Comment.Meta.Vars.target == \"%s\"", updateCondition, ctrl.Config.Vars["target"])
+	prg, err := ctrl.Expr.Compile(custom_updateCondition)
+	if err != nil {
+		return err //nolint:wrapcheck
+	}
+
+	login, err := ctrl.GitHub.GetAuthenticatedUser(ctx)
+	if err != nil {
+		logrus.WithError(err).Warn("get an authenticated user")
+	}
+
+	comments, err := ctrl.GitHub.ListComments(ctx, &github.PullRequest{
+		Org:      cmt.Org,
+		Repo:     cmt.Repo,
+		PRNumber: cmt.PRNumber,
+	})
+	if err != nil {
+		return fmt.Errorf("list issue or pull request comments: %w", err)
+	}
+	logrus.WithFields(logrus.Fields{
+		"org":       cmt.Org,
+		"repo":      cmt.Repo,
+		"pr_number": cmt.PRNumber,
+	}).Debug("get comments")
+
+	for _, comnt := range comments {
+		if comnt.IsMinimized {
+			// ignore minimized comments
+			continue
+		}
+		if login != "" && comnt.Author.Login != login {
+			// ignore other users' comments
+			continue
+		}
+
+		metadata := map[string]interface{}{}
+		hasMeta := extractMetaFromComment(comnt.Body, &metadata)
+		paramMap := map[string]interface{}{
+			"Comment": map[string]interface{}{
+				"Body":    comnt.Body,
+				"Meta":    metadata,
+				"HasMeta": hasMeta,
+			},
+			"Commit": map[string]interface{}{
+				"Org":      cmt.Org,
+				"Repo":     cmt.Repo,
+				"PRNumber": cmt.PRNumber,
+				"SHA1":     cmt.SHA1,
+			},
+			"Vars": cmt.Vars,
+		}
+
+		logrus.WithFields(logrus.Fields{
+			"node_id":   comnt.ID,
+			"condition": updateCondition,
+			"param":     paramMap,
+		}).Debug("judge whether an existing comment is ready for editing")
+		f, err := prg.Run(paramMap)
+		if err != nil {
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"node_id": comnt.ID,
+			}).Error("judge whether an existing comment is hidden")
+			continue
+		}
+		if !f {
+			continue
+		}
+		cmt.CommentID = comnt.DatabaseID
+	}
+	return nil
 }
 
 func (ctrl *ExecController) post(
 	ctx context.Context, execConfigs []*config.ExecConfig, cmtParams *ExecCommentParams,
 	templates map[string]string,
 ) error {
-	cmt, f, err := ctrl.getComment(execConfigs, cmtParams, templates)
+	cmt, f, err := ctrl.getComment(ctx, execConfigs, cmtParams, templates)
 	if err != nil {
 		return err
 	}
